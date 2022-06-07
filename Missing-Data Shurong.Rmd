@@ -1,0 +1,677 @@
+---
+title: "Lab 2 - Missing Data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Comparison of imputation methods
+
+We provide, for some of the main packages (the list is of course not thorough) to impute missing values, links to vignettes and tutorials, as well as a description of their main functionalities and reusable code. The methods we focus on are gathered in the table below.
+
+| Package       | Data Types    | Underlying Method   | Imputation | Computational Time| Comments |
+| ------------- |:--------------| ------------------- |------------|:-------------:|--------------|
+| softImpute    | quantitative  |low-rank matrix completion with nuclear norm penalities | single| + |Very fast, strong theoretical guarantees, regularization parameter to tune |
+| mice          | mixed         |multivariate imputation by chained equations | multiple   | -  | Very flexible to data types, no parameter to tune |
+| missForest    | mixed         |random forests| single|-| Requires large sample sizes, no parameter to tune |
+| missMDA       | mixed         |low-rank matrix completion with penality| single/multiple | + | Rank parameter to tune |
+
+
+```{r libraries, message=FALSE, error=FALSE, warning=FALSE}
+library(Amelia)
+library(mice)
+library(missForest)
+library(missMDA)
+library(MASS)
+library(softImpute)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(devtools)
+```
+
+## Generation of incomplete Gaussian data
+
+We will compare these imputation methods on synthetic Gaussian data. 
+
+__(R1)__ Generate a synthetic Gaussian data matrix $X$ of size $n\times p$, $n=1000$ and $p=10$, such that each row $X_i \sim \mathcal{N}(\mu_X, \Sigma_X)$, $\mu_X = (1,\ldots, 1)$ and $\Sigma_{ij} = 0$ if $i\neq j$ and $\Sigma_{ii} = 1$.
+
+*Hint:* In R, you can generate multivariate Gaussian data using the function mvrnorm.
+
+```{r}
+library(MASS)
+?mvrnorm
+```
+
+```{r}
+library(mvtnorm)
+n<-1000
+mu<-rep(1,each=10)
+sigma<-diag(1,nrow=10,ncol=10)
+Y<-rmvnorm(n,mu,sigma)
+```
+
+
+__(R2)__ Write a function produce_NA which takes as input a data matrix and a proportion $p\in (0,1)$ and outputs a replicate of the data which is equal to $X$ but has a proportion $p$ of MCAR missing values, and the missing data pattern (binary matrix indicating missing values). Create a new matrix $X_{\text{miss}}$ which replicates $X$ with a proportion $0.3$ of missing values.
+
+
+
+```{r}
+produce_NA <- function(X, p){
+  Xmiss <- X
+  L <- length(X)
+  idx_missing <- sample(1:L, round(p*L))
+  Xmiss[idx_missing] = NA
+  pattern <- is.na(Xmiss)
+  pattern[idx_missing]=1
+  pattern[-idx_missing]=0
+  mylist=list("Xmiss"=Xmiss,"pattern"=pattern)
+  return(mylist)
+}
+
+
+Y_miss=produce_NA(Y,0.3)[1]
+Y_pattern=produce_NA(Y,0.3)[2]
+```
+
+
+
+## Main imputation packages in R
+
+__(R3)__ We provide below code for some of the main imputation methods in R. Try them out and play with the different parameters.
+
+### softImpute
+
+The [`softImpute` package](https://cran.r-project.org/web/packages/softImpute/index.html) can be used to impute quantitative data. It fits a low-rank matrix approximation to a matrix with missing values via nuclear-norm regularization. A [vignette is available online](https://web.stanford.edu/~hastie/swData/softImpute/vignette.html), as well as the original article [@hastie2015matrix].
+
+The **softImpute** function computes, based on an incomplete dataset, a low-dimensional factorization which can be used to impute the missing values. The function is used as follows:
+
+```{r softImpute}
+# some toy matrix
+X<- matrix(rnorm(24), nrow=8)
+XNA<-X
+XNA[c(1,3,10)] <- NA
+# perform softImpute
+sft <- softImpute(x = XNA, rank.max = 2, lambda = 0, type = c("als", "svd"))
+sft
+```
+
+The main arguments are the following (more details can be found on the help page).
+
+* `x`: the dataset with missing values (matrix).
+
+* `rank.max`: the restricted rank of the solution, which should not be bigger than min(dim(x))-1.
+
+* `lambda`: the nuclear-norm regularization parameter.
+
+* `type`: indicates the algorithm which should be used, among "svd" and "als". "svd" returns an exact solution, while "als" returns an approximate solution (in exchange for a faster computation time).
+
+To compute the imputed dataset based on the softImpute results, one may use the following code:
+
+```{r softImpute-impute}
+# compute the factorization
+X.sft <- sft$u %*% diag(sft$d) %*% t(sft$v)
+X.sft
+
+# replace missing values by computed values
+X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+X.sft
+```
+
+To calibrate the rank and the parameter lambda, one may perform cross-validation. For simplicity, we will use the default values rank=2 and lambda=0.
+
+### mice
+
+The [`mice` package](https://CRAN.R-project.org/package=mice) implements a multiple imputation methods for multivariate missing data. It can impute mixes of continuous, binary, unordered categorical and ordered categorical data, as well as two-level data. The original article describing the software, as well as the source package [@mice] and example code are available online [here](https://github.com/stefvanbuuren/mice).
+
+The **mice** function computes, based on an incomplete dataset, multiple imputations by chained equations and thus returns $m$ imputed datasets. 
+
+```{r mice, results=FALSE}
+mice_mice <- mice(data = XNA, m = 5, method = "pmm") #contains m=5 completed datasets.
+#mice::complete(mice_mice, 1) #get back the first completed dataset of the five available in mice_res
+```
+
+The main arguments are the following (more details can be found on the help page).
+
+* `data`: the dataset with missing values (matrix).
+
+* `m`: number of multiple imputations.
+
+* `method`: the imputation method to use. 
+
+By default, the predictive mean matching method is performed. Other imputation methods can be used, type `methods(mice)` for a list of the available imputation methods.
+
+We aggregate the complete datasets using the mean of the imputations to get a simple imputation.
+
+```{r mice-aggregation}
+IMP <- 0
+for (i in 1:5) { IMP <- IMP + mice::complete(mice_mice, i)}
+X.mice  <-  IMP/5  #5 is the default number of multiple imputations
+X.mice
+```
+
+
+### missForest
+
+The [`missForest` package](https://cran.r-project.org/web/packages/missForest/index.html) can be used to impute mixed-type data (continuous or categorical data). 
+
+The **missForest** function imputes missing values iteratively by training random forests. A vignette is available [online](https://stat.ethz.ch/education/semesters/ss2012/ams/paper/missForest_1.2.pdf) as well as the original paper [@missforest]. 
+
+```{r missForest, message=FALSE, results = "hide"}
+forest <- missForest(xmis = XNA, maxiter = 20, ntree = 100)
+```
+
+The main arguments are the following (more details can be found on the help page).
+
+* `xmis`: the dataset with missing values (matrix).
+
+* `maxiter`: maximum number of iterations to be performed given the stopping criterion is not met beforehand.
+
+* `ntree`: number of trees for each forest.
+
+
+```{r missForest imputation}
+X.forest<- forest$ximp
+X.forest
+```
+
+
+### missMDA
+
+The [`missMDA` package](https://cran.r-project.org/web/packages/missMDA/index.html) serves to impute mixed-type data (continuous or categorical data). 
+
+The **imputePCA** function imputes missing values applying principal component methods. The missing values are predicted using the iterative PCA algorithm for a predefined number of dimensions. Some information are available in the original article [@missMDA] and some videos are online [here](https://www.youtube.com/watch?v=OOM8_FH6_8o) or [here (in french)](https://www.youtube.com/watch?v=bdD9P3fGb70). 
+
+```{r imputePCA}
+pca <- imputePCA(X = XNA, ncp = 2, scale = TRUE, method = c("Regularized","EM"))
+pca
+```
+
+
+The main argument are the following (more details can be found on the help page).
+
+* `X`: the dataset with missing values (matrix).
+
+* `ncp`: number of components used to predict the missing entries.
+
+* `scale`: if TRUE, it implies that the same weight is given for each variable.
+
+
+The single imputation step requires tuning the number of dimensions used to impute the data. We use the function **estim_ncpPCA** which estimates the number of the dimensions using a cross-validation. Different cross-validation methods can be used to estimate the number of components, by default a generalized cross-validation is performed.  
+
+```{r imputePCA with estimation ncp}
+ncp.pca <- estim_ncpPCA(XNA,method.cv="gcv")$ncp
+pca <- imputePCA(XNA, ncp = ncp.pca)
+X.pca <- pca$comp
+X.pca
+```
+
+
+## Numerical experiments to compare the different methods
+
+
+We compare the methods in terms of mean squared error (MSE), i.e.:
+$$MSE(X^{imp}) = \frac{1}{n_{NA}}\sum_{i}\sum_{j} 1_{X^{NA}_{ij}=NA}(X^{imp}_{ij} - X_{ij})^2$$
+where $n_{NA} = \sum_{i}\sum_{j} 1_{X^{NA}_{ij}=NA}$ is the number of missing entries in $X^{NA}$.
+
+
+__(R4)__ Write a function which takes as argument the missing data pattern (the mask), the true (complete) data matrix and the imputed data matrix, and outputs the MSE.
+
+
+
+```{r}
+MSE<-function(pattern,mat_complet,mat_imp){
+  nna=sum(pattern)
+  #vect=which(pattern==1)
+  res=(1/nna)*sum((pattern)*(mat_complet-mat_imp)^2)
+  return(res)
+}
+
+```
+
+
+
+
+__(R5)__ Write a function **HowToImpute** which compares the methods above with the naive imputation by the mean in terms of MSE on a complete dataset. 
+
+*Hint:* To do so, the function should take as arguments are the following. 
+
+* `X`: the complete dataset where the missing values will be introduced (matrix).
+
+* `perc`: the percentage of missing values to add.
+
+* `nbsim`: number of simulations performed. 
+
+For each simulation in $1,\ldots, nbsim$, reproduce the steps (1) introduce missing values with produceNA (2) impute the missing values with each method (3) compute the MSE for each method. Finally, return a table containing the mean of the MSEs for the simulations performed. 
+
+
+```{r}
+HowToImpute<-function(X,perc,nbsim){
+  MSE_sft<-rep(0,nbsim)
+  MSE_mice<-rep(0,nbsim)
+  MSE_forest<-rep(0,nbsim)
+  MSE_pca<-rep(0,nbsim)
+  
+  for (i in 1:nbsim) {
+    XNA<-produce_NA(X,perc)$Xmiss
+    sft <- softImpute(x = XNA, rank.max = 2, lambda = 0, type = c("als", "svd"))
+    X.sft <- sft$u %*% diag(sft$d) %*% t(sft$v)
+    mice_mice <- mice(data = XNA, m = 5, method = "pmm")
+    IMP2 <- 0
+    for (j in 1:5) { IMP2 <- IMP2 + mice::complete(mice_mice, j)}
+    X.mice  <-  IMP2/5  #5 is the default number of multiple imputations
+    forest <- missForest(xmis = XNA, maxiter = 20, ntree = 100)
+    X.forest<- forest$ximp
+    pca <- imputePCA(X = XNA, ncp = 2, scale = TRUE, method = c("Regularized","EM"))
+    X.pca <- pca$comp
+    pattern<-produce_NA(X,perc)$pattern
+    MSE_sft[i]<-MSE(pattern,X,X.sft)
+    MSE_mice[i]<-MSE(pattern,X,X.mice)
+    MSE_forest[i]<-MSE(pattern,X,X.forest)
+    MSE_pca[i]<-MSE(pattern,X,X.pca)
+  }
+  print(MSE_sft)
+  print(MSE_mice)
+  print(MSE_forest)
+  print(MSE_pca)
+  mean_MSE_sft<-mean(MSE_sft)
+  mean_MSE_mice<-mean(MSE_mice)
+  mean_MSE_forest<-mean(MSE_forest)
+  mean_MSE_pca<-mean(MSE_pca)
+  mylist<-list("moyenne MSE de sft"=mean_MSE_sft,"moyenne MSE de mice"=mean_MSE_mice,"moyenne MSE de forest"=mean_MSE_forest,"moyenne MSE de pca"=mean_MSE_pca)
+  print("moyenne MSE de chaque méthode:")
+  print(mylist)
+  tab<-data.frame(MSE_sft=mean_MSE_sft,MSE_mice=mean_MSE_mice,MSE_forest=mean_MSE_forest,MSE_pca=mean_MSE_pca)
+  rownames(tab)<-c("Moyenne des MSEs:")
+  tab2<-data.frame(MSE_sft=MSE_sft,MSE_mice=MSE_mice, MSE_forest=MSE_forest, MSE_pca=MSE_pca)
+  tableau<-rbind(tab2,tab)
+  return(tableau)
+}
+```
+
+__(R6)__ Apply the simulation to the data matrix $X$ and comment the results. 
+
+```{r}
+X_test<- Y
+HowToImpute(X_test,0.3,3)
+```
+
+Pour $p=0.3$ et $nbsim=3$, on a la plus grande MSE de méthode softImpute par rapport ces 4 méthodes et la moyenne de MSE de méthode PCA eest plus petite. Donc la méthode PCA a une meilleure performance ici et softImput a une plus mauvaise performance. 
+
+```{r}
+X_test<- Y
+HowToImpute(X_test,0.8,3)
+```
+Pour $p=0.8$ et $nbsim=3$, on a plus des valeurs manquantes par rapport précédemment, on peut observer que la moyenne de MSE de mice a une plus petite valeur donc la méthode mice a une meilleure performance dans ce cas. 
+
+
+```{r}
+X_test<- Y
+HowToImpute(X_test,0.3,10)
+```
+
+Pour $p=0.3$ et $nbsim=10$, on a la plus grande MSE de méthode softImpute par rapport ces 4 méthodes et la moyenne de MSE de méthode PCA eest plus petite. Donc la méthode PCA a une meilleure performance ici.
+
+
+```{r}
+X_test<- Y
+HowToImpute(X_test,0.8,10)
+```
+
+Pour $p=0.8$ et $nbsim=10$, on a plus des valeurs manquantes par rapport précédemment, on peut observer que la moyenne de MSE de mice a une plus petite valeur donc la méthode mice a une meilleure performance dans ce cas. Et cette moyenne n'a pas beaucoup de différence avec $nbsim=3$. Cela signifie que la convergence de MSE pour mice.
+
+
+*Important remark:* Note that, the results are subjective to each data set. One method can perform better on some data set and worse on others. 
+
+## Comparisons on real datasets
+
+We will now compare the methods on real complete dataset taken from the UCI repository in which we will introduce missing values. In the present workflow, we propose a selection of several datasets (here, the datasets contain only quantitative variables) : 
+
+- Wine Quality - Red (1599x11)
+- Wine Quality - White (4898x11)
+- Slump (103x9)
+- Movement (360x90)
+- Decathlon (41x10)
+
+But you can test the methods on any complete dataset you want.
+
+__(R7)__ Load the data sets from the Rmisstastic platform using the following code:
+
+```{r}
+wine_white <- read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-white.csv", sep = ";") 
+wine_white <- wine_white[, -ncol(wine_white)]
+
+wine_red <- read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv", sep = ";")
+wine_red <- wine_red[, -ncol(wine_red)]
+
+slump <-read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/concrete/slump/slump_test.data", sep = ",", header = TRUE, row.names=1)
+slump <- slump[, -ncol(slump)]
+
+movement <- read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/libras/movement_libras.data", sep = ",", header = FALSE)
+movement  <- movement[, -ncol(movement)]
+```
+
+__(R8)__ Apply the function **HowToImpute** to each data set, and comment the results. 
+*Hint:* Be careful, this may take a long time, especially for large data sets. You can reduce the number of simulations nbsim.
+
+
+```{r}
+wine_white<-data.matrix(wine_white)
+HowToImpute(wine_white,0.3,5)
+```
+
+```{r}
+wine_red<-data.matrix(wine_red)
+HowToImpute(wine_red,0.3,5)
+```
+
+```{r}
+slump<-data.matrix(slump)
+HowToImpute(slump,0.3,5)
+```
+
+
+Pour $p=0.3$ et $nbsim=5$, On peut constater que la moyenne de MSE de méthode forest est la plus petite dans ces data sets. Donc la méthode Missforest a une meilleure performance. La deuxième est la méthode mice et la troisièment est la méthode PCA, la méhode SoftImpute a une plus mauvaise performance. 
+
+# Continuous data with missing values - Regression with missing data via Multiple Imputation
+
+First of all you will need to install the following packages
+
+```{r eval=FALSE}
+install.packages("VIM")
+install.packages("missMDA")
+install.packages("Amelia")
+```
+
+Air pollution is currently one of the most serious public health worries worldwide. Many epidemiological studies
+have proved the influence that some chemical compounds, such as sulfur dioxide (SO2), nitrogen dioxide
+(NO2), ozone (O3), can have on our health. Associations set up to monitor air quality are active all over the
+world to measure the concentration of these pollutants. They also keep a record of meteorological conditions
+such as temperature, cloud cover, wind, etc.  
+
+We have at our disposal 112 observations collected
+during the summer of 2001 in Rennes. The variables available are 
+
+* maxO3 (maximum daily ozone) 
+* maxO3v (maximum daily ozone the previous day) 
+* T12 (temperature at midday) 
+* T9 
+* T15 (Temp at 3pm)
+* Vx12 (projection of the wind speed vector on the east-west axis at midday)
+* Vx9 and Vx15 as well as the Nebulosity (cloud) Ne9, Ne12, Ne15
+
+Here the final aim is to analyse the relationship between the
+maximum daily ozone (maxO3) level and the other meteorological variables. To do so we will perform regression to explain maxO3 in function of all the other variables. This data is incomplete (there are missing values). Indeed, it occurs frenquently to have machines that fail one day, leading to some information not recorded. We will therefore perform regression via multiple imputation.
+
+__(R1)__ Import the data and load the libraries.
+
+
+
+```{r}
+don <- read.csv("/Users/shurongzhang/Downloads/ozoneNA.csv")
+dim(don)
+don
+```
+
+First, we perfom some descriptive statistics (how many missing? how many variables, individuals with missing?) and try to **inspect and vizualize the pattern of missing entries and get hints on the mechanism** that generated the missingness.  For this purpose, we use the R package **VIM** (Visualization and Imputation of Missing Values - Mathias Templ) as well as Multiple Correspondence Analysis (FactoMineR package). The package VIM provides tools for the visualization of missing or imputed values, which can be used for exploring the data and the structure of the missing or imputed values. Depending on this structure, they may help to identify the mechanism generating the missing values or errors, which may have happened in the imputation process. You should install the package VIM, then you can check the documentation by executing
+
+```{r VIM0, eval=FALSE}
+library(VIM)
+```
+
+The VIM function **aggr** calculates and plots the amount of missing entries in each variables and in some combinations of variables (that tend to be missing simultaneously).
+
+```{r VIM, eval=FALSE}
+dim(na.omit(don))
+res<-summary(aggr(don, sortVar=TRUE))$combinations
+```
+
+```{r VIM2, eval=FALSE}
+head(res[rev(order(res[,2])),])
+aggr(don, sortVar=TRUE)
+```
+
+We can see here that the combination which is the most frequent is the one where all the variables are observed (13 values). Then, the second one is the one where T9, T12 and T15 are simultaneously missing (7 rows) (1 is missing, 0 is observed - there is a 1 for the second, third and fourth variables). The graph on the right panel represents these pattern, with blue for observed and red for missing. 
+
+
+The VIM function **matrixplot ** creates a matrix plot in which all cells of a data matrix are visualized by rectangles. Available data is coded according to a continuous color scheme (gray scale), while missing/imputed data is visualized by a clearly distinguishable color (red). If you use Rstudio the plot is not interactive (thus the warnings), but if you use R directly, you can click on a column of your choice, this will result in sorting the rows in the decreasing order of the values of this column. This is useful to check if there is an association between the value of a variable and the missingness of another one.
+
+```{r VIM-matrixplot, eval=FALSE}
+matrixplot(don,sortby=2) # marche pas sur Rstudio
+```
+
+We can observed that often when T9 is missing, T12 and T15 are also missing. We see more "red" values. We do not see more black or white values associated which should imply that when T9 is missing it would have corresponded to high or low values in another variable which should suggest MAR missing values for instance. Here everything points to MCAR values.
+
+
+The VIM function **marginplot** creates a scatterplot with additional information on the missing values. If you plot the variables (x,y), the points with no missing values are represented as in a standard scatterplot. The points for which x (resp. y) is missing are represented in red along the y (resp. x) axis. In addition, boxplots of the x and y variables are represented along the axes with and without missing values (in red all variables x where y is missing, in blue all variables x where y is observed).
+
+```{r VIM-marginplot, eval=FALSE}
+marginplot(don[,c("T9","maxO3")])
+```
+
+We can see here that the distribution of T9 is the same when maxO3 is oberved and when maxO3 is missing. If the two boxplots (red and blue) would have been very different it would imply that when maxO3 is missing the values of T9 can be very high or very low which lead to suspect the MAR hypothesis. 
+
+__(Q2)__ Do you observe any associations between the missing entries ? When values are missing on a variable does it correspond to small or large values on another one ? (For this question you need to use the matrixplot function in R)
+
+On peut observer que qu'il y a le lien de missing values entre T9, T12 et T15, dans ce cas, nous voyons plus de valeurs "rouges". Nous ne voyons pas plus de valeurs noires ou blanches associées, ce qui devrait impliquer que lorsque T9(T12,T15) est manquante, cela aurait correspondu à des valeurs élevées ou faibles dans une autre variable. Ainsi il y a le lien de missing values entre Ne9, Ne12 et Ne15. Dans ce cas, nous voyons qu'il y a plus de valeurs noires associées, ce qui implique que lorque Ne9(Ne12,Ne15) est manquante, cela n'aurait pas correspondu à des valeurs élevées ou faibles dans une autre variable Les autres variables sont indépendantes pour les missing values. Dans ce cas, nous voyons plus de valeurs "rouges". Nous ne voyons pas plus de valeurs noires ou blanches associées.
+
+__(R3)__ Create a categorical dataset with "o" when the value of the cell is observed and "m" when it is missing, and with the same row and column names as in the original data. Then, you can perform Multiple Correspondence Analysis to visualize the association with the
+**MCA** function.
+
+```{r eval=FALSE}
+?MCA
+```
+
+Then, before modeling the data, we perform a **PCA with missing values** to explore the correlation between variables. Use the R package **missMDA** dedicated to perform principal components methods with missing values and to impute data with PC methods.
+
+```{r}
+pattern <- is.na(don)[,2:12]
+X<-don[,1]
+pattern_new<-cbind(X,pattern)
+WindDirection<-don[,13]
+pattern_new2<-cbind(pattern_new,WindDirection)
+nb_element<-length(don)*count(don)#1456 nombre d'éléments dans la table
+
+for (i in 1:1456) {
+  if (pattern_new2[i]==1){
+    pattern_new2[i]="m"
+  } 
+  else if(pattern_new2[i]==0){
+    pattern_new2[i]="o"
+  }
+  }
+
+#pattern[idx_missing]=1
+#pattern[-idx_missing]=0
+pattern_new2
+
+```
+
+
+__(R4)__ Determine the number of components ncp to keep using the 
+**estim_ncpPCA** function. Perform PCA with missing values using the 
+**imputePCA** function and ncp components. Then plot the correlation circle.
+
+
+```{r eval=FALSE}
+?estim_ncpPCA
+?imputePCA
+```
+
+```{r}
+estim_ncpPCA(don[,2:12])
+```
+
+A l'aide de function estim_ncpPCA, on a 2 components ncp.
+
+```{r}
+Imp_PCA<-imputePCA(don[,2:12],ncp=2)
+```
+
+```{r}
+library(FactoMineR)
+res.pca=PCA(don[,2:12])
+```
+
+On remarque qu’il y a 44.83% informations sur le premier axe, 17.22% informations sur le second axe.
+Ensuite, on voit que T9, T12 et T15 sont bien corrélés entre eux, ainsi, ils sont corrélé positivement à l'axe1. Ne9, Ne12 et Ne15 sont bien corrélés entre eux. De plus, ils sont corrélés négativement à l'axe1. Enfin, Vx9, Vx12 et Vx15 sont bien corrélés entre eux et ils sont corrélés positivement à l'axe1 et négativement à l'axe2. 
+
+
+The package missMDA allows the use of principal
+component methods for an incomplete data set. To achieve this goal in the case of PCA, the missing values are predicted using the iterative PCA algorithm for a predefined number of dimensions. Then, PCA is performed on the imputed data set. 
+The single imputation step requires tuning the number of dimensions used to impute the data. 
+
+__(Q4)__ Could you guess how cross-validation is performed to select the number of components? 
+
+Pour la validation croisée de type "leave-one-out" (loo), chaque cellule de la matrice de données est alternativement supprimée et prédite avec un modèle PCA utilisant les dimensions ncp.min à ncp.max. Le nombre de composantes qui conduit à la plus petite MSEP est retenu. Pour la validation croisée Kfold, le pourcentage de valeurs manquantes pNA est inséré et prédit avec un modèle PCA utilisant les dimensions ncp.min à ncp.max. Ce processus est répété nbsim fois. Le nombre de composantes qui conduit au plus petit MSEP est retenu. 
+
+
+
+Then, to run the regression with missing values, we use **Multiple Imputation**. We impute the data either assuming 1) a Gaussian distribution (library Amelia) or 2) a PCA based model (library missMDA). 
+Note that there are two ways to impute either using a Joint Modeling (one joint probabilitisc model for the variables all together)
+or a Condional Modeling (one model per variable) approach. We refer to the references given in the slides for more details.  We use the R package **Amelia**. We generate 100 imputed data sets with the amelia method:
+
+```{r }
+library(Amelia)
+```
+
+```{r eval=FALSE}
+?amelia
+```
+
+```{r eval=FALSE}
+res.amelia <- amelia(don[,2:12], m=100)  
+#names(res.amelia$imputations) 
+res.amelia$imputations$imp1# the first imputed data set
+```
+
+__(R5)__ Now generate 100 imputed data sets with the MIPCA method and 2 components. Store the result in a variable called res.MIPCA.
+
+```{r eval=FALSE}
+?MIPCA
+?plot.MIPCA
+```
+
+```{r}
+res.MIPCA<-MIPCA(don[,2:12],ncp=2,nboot=100)
+plot(res.MIPCA)
+```
+
+Exploratory analysis is very important and even at this stage of the analysis.
+
+We will **inspect the imputed values created** to know if the imputation method should require more investigation or if we can continue and analyze the data. A common practice consists in comparing the distribution of the imputed values and of the observed values. Check the **compare.density** function and apply it to compare the distributions of the T12 variable.
+
+```{r  eval=FALSE}
+?compare.density
+```
+
+```{r}
+compare.density(res.amelia,var="T12")
+```
+
+__(Q6)__ Do both distributions need to be close? Could the missing values differ from the observed ones both in spread and in location? 
+
+On remarque que cela sera mieux si les deux distributions se rapprochent mais une petite différence ou décalage entre les deux distributions n'est pas grave, cela ne veut pas forcément dire que le modèle est mauvais. Cependant, si on a une différence ou décalage très importante, alors il faut qu'on demande plus des investigations. 
+
+
+The quality of imputation can also be assessed with cross-validation using the **overimpute** function. Each observed value is deleted and for each one 100 values are predicted (using the same MI method) and the mean and 90% confidence intervals are computed for these 100 values. Then, we inspect whether the observed value falls within the obtained interval. On the graph, the y=x line is plotted (where the imputations should fall if they were perfect), as well as the mean (dots) and intervals (lines) for each value. Around ninety percent of these confidence intervals should contain the y = x line, which means that the true observed value falls
+within this range. The color of the line (as coded in the legend) represents the
+fraction of missing observations in the pattern of missingness for that observation (ex: blue=0-2 missing entries). 
+
+```{r eval=FALSE}
+?overimpute
+```
+
+```{r}
+overimpute(res.amelia,var="T12")
+```
+
+
+__(Q7)__ Comment the quality of the imputation.
+
+On peut constater que pour blue=0-2 missing entries et vert=2-4 missing entries, la moyenne et l'intervalle confiance d'imputations sont plutôts tombées sur la line y=x ceux qui ne sont pas mals. Pour orange=4-6 missing entries, red=6-8 et red=8-1 missing entries, la moyenne et l'intervalle confiance d'imputations sont plutôts éloignées à la line y=x par rapport le blue et le vert. Donc ceux qui ne sont pas les meilleurs imputations par rapport le blue et le vert.
+
+__(R8)__ Apply a regression model on each imputed data set of the amelia method. Hint: a regression with several variables can be performed as follows 'lm(formula="maxO3 ~ T9+T12", data =don)'. You can also use the function
+**with**.
+
+
+
+```{r}
+aggr_MI<-lapply(1:100,function(i) (lm(formula="maxO3 ~ T9+T12+T15+Vx12+Vx9+Vx15+Ne9+Ne12+Ne15", data= res.amelia$imputations[[i]])))
+
+```
+
+__(R10)__ Aggregate the results of Regression with Multiple Imputation according to Rubin's rule (slide "Multiple imputation") for MI with amelia with the 
+**pool** function from the mice package.
+
+```{r}
+sum_aggr_MI<-pool(aggr_MI)
+sum_aggr_MI
+```
+
+
+__(R9)__ Now do the same with the imputed datasets of the MIPCA method.
+
+```{r}
+res.MIPCA$res.imputePCA=as.data.frame(res.MIPCA$res.imputePCA)
+```
+
+
+```{r}
+
+aggr_MIPCA<-lapply(1:100,function(i) (lm(formula="maxO3 ~ T9+T12+T15+Vx12+Vx9+Vx15+Ne9+Ne12+Ne15", data =res.MIPCA$res.MI[[i]])))
+
+
+```
+
+
+__(R11)__ Now do the same with the MIPCA results.
+
+```{r}
+sum_aggr_MIPCA<-pool(aggr_MIPCA)
+sum_aggr_MIPCA
+```
+
+
+
+
+__(R12)__ Write a function that removes the variables with the largest pvalues step by step (each time a variable is removed the regression model is performed again) until all variables are significant.
+
+
+
+```{r}
+rep<-lapply(1:100, 
+       function(i) broom::tidy(lm(formula="maxO3 ~ T9+T12+T15+Vx12+Vx9+Vx15+Ne9+Ne12+Ne15", data =res.MIPCA$res.MI[[i]])))
+
+rep[1]
+```
+
+```{r}
+
+pvalue<-0.05
+data_new<-res.MIPCA$res.MI
+res<-broom::tidy(lm(formula="maxO3 ~.", data =data_new[[1]]))
+
+remove<-function(){
+for (i in 1:100) {
+  y2<-which.max(res$p.value)+1
+  res<-broom::tidy(lm(formula="maxO3 ~.", data =data_new[[i]][-y2]))
+  y<-max(res$p.value)
+  if (y> 0.05) {
+    y2<-which.max(res$p.value)+1
+    res<-broom::tidy(lm(formula="maxO3 ~.", data =data_new[[i]][-y2]))
+  }
+  else{
+    return (res)
+  }
+  
+}
+  return (res)
+}
+
+```
+
+
